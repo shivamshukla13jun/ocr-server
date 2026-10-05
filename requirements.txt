@@ -1,0 +1,10 @@
+# paddlepaddle 3.3.x crashes on Windows/CPU with
+# "ConvertPirAttribute2RuntimeAttribute not support" — 3.0.0 is the
+# known-stable pairing for paddleocr 3.x
+paddlepaddle==3.0.0
+paddleocr>=3.0,<4
+fastapi
+uvicorn[standard]
+python-multipart
+opencv-python-headless
+numpy
