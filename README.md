@@ -1,16 +1,19 @@
 # PaddleOCR Server
 
-Lightweight, self-hosted OCR sidecar for manga/webtoon pages. Runs the
-**PP-OCRv5 mobile** models (detection + recognition) on CPU — no GPU, no API
-keys, no rate limits.
+Lightweight, self-hosted OCR + translation sidecar for manga/webtoon pages.
+Runs the **PP-OCRv5 mobile** models (detection + recognition) on CPU — no GPU,
+no API keys, no rate limits. Hindi translation uses `deep-translator` (free
+Google Translate / MyMemory fallback).
 
 The app talks to it over HTTP:
 
-- `GET  /health` → `{ "ok": true, "engine": "paddleocr" }`
+- `GET  /health` → `{ "ok": true, "engine": "paddleocr", "canTranslate": true }`
 - `POST /ocr` (multipart field `file` = page image) →
   `{ "success": true, "lines": ["bubble 1", "bubble 2", ...], "raw": "..." }`
 - `POST /preprocess` (multipart field `file` = page image) →
   cleaned PNG image bytes (denoise, contrast, watermark removal, text sharpening)
+- `POST /translate` (JSON `{ text, target?, source? }`) →
+  `{ "success": true, "text": "translated text" }`
 
 Detections are grouped into speech bubbles in reading order (top→bottom,
 left→right), which is what the Studio OCR pipeline stores as narration.
@@ -19,9 +22,10 @@ left→right), which is what the Studio OCR pipeline stores as narration.
 
 | Method | Path           | Body                            | Returns                        |
 |--------|----------------|---------------------------------|--------------------------------|
-| GET    | `/health`      | —                               | `{ ok, engine }`               |
+| GET    | `/health`      | —                               | `{ ok, engine, canTranslate }` |
 | POST   | `/ocr`         | multipart `file` (png/jpg/webp) | `{ success, lines, raw }`      |
 | POST   | `/preprocess`  | multipart `file` (png/jpg/webp) | cleaned PNG bytes (image/png)  |
+| POST   | `/translate`   | JSON `{ text, target, source }` | `{ success, text }`            |
 
 ## Run with Docker (recommended)
 
@@ -76,9 +80,14 @@ curl -X POST http://localhost:5004/ocr -F "file=@page.png"
 
 # Preprocess (clean) an image — returns PNG bytes
 curl -X POST http://localhost:5004/preprocess -F "file=@page.png" --output cleaned.png
+
+# Translate English to Hindi
+curl -X POST http://localhost:5004/translate -H "Content-Type: application/json" \
+  -d '{"text": "The hero stood tall.", "target": "hi", "source": "en"}'
 ```
 
 Expected OCR response: `{"success":true,"lines":[ ...bubble texts... ]}`
+Expected translate response: `{"success":true,"text":"नायक लंबा खड़ा था।"}`
 
 ## Notes
 
@@ -91,3 +100,5 @@ Expected OCR response: `{"success":true,"lines":[ ...bubble texts... ]}`
   than speed, swap `PP-OCRv5_mobile_det/rec` for `PP-OCRv5_server_det/rec`
   in `get_engine()` — the download is bigger but one-time.
 - `lang="en"` — switch to `lang="ch"`/`"japan"` etc. for other scripts.
+- Translation tries Google Translate first (free API), falls back to
+  MyMemory if Google rate-limits. No API key required for either.

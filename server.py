@@ -2,9 +2,10 @@
 Lightweight PaddleOCR HTTP service for manga/webtoon pages.
 
 Endpoints:
-  POST /ocr         (multipart "file") -> { success, lines, raw }
-  POST /preprocess   (multipart "file") -> cleaned PNG image bytes
-  GET  /health       -> { ok, engine }
+  POST /ocr          (multipart "file") -> { success, lines, raw }
+  POST /preprocess    (multipart "file") -> cleaned PNG image bytes
+  POST /translate     (JSON { text, target? }) -> { success, text }
+  GET  /health        -> { ok, engine }
 """
 
 import io
@@ -12,6 +13,7 @@ import numpy as np
 import cv2
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
 app = FastAPI()
 _engine = None
@@ -115,7 +117,7 @@ def group_bubbles(items: list[dict]) -> list[str]:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "engine": "paddleocr"}
+    return {"ok": True, "engine": "paddleocr", "canTranslate": True}
 
 
 # ---- Image preprocessing (clean manga pages before OCR) ---- #
@@ -230,6 +232,91 @@ async def preprocess(file: UploadFile = File(...)):
         return Response(content=buf.tobytes(), media_type="image/png")
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+# ---- Translation (free, no API key) ---- #
+
+class TranslateRequest(BaseModel):
+    text: str
+    target: str = "hi"  # default: English -> Hindi
+    source: str = "en"
+
+
+# MyMemoryTranslator needs full locale codes, not short ISO codes
+_MYMEMORY_LANG = {
+    "en": "en-GB", "hi": "hi-IN", "es": "es-ES", "fr": "fr-FR",
+    "de": "de-DE", "ja": "ja-JP", "ko": "ko-KR", "zh": "zh-CN",
+    "ar": "ar-SA", "pt": "pt-PT", "ru": "ru-RU", "it": "it-IT",
+    "nl": "nl-NL", "tr": "tr-TR", "vi": "vi-VN", "th": "th-TH",
+    "bn": "bn-IN", "ta": "ta-IN", "te": "te-IN", "mr": "mr-IN",
+    "gu": "gu-IN", "kn": "kn-IN", "ml": "ml-IN", "pa": "pa-IN",
+    "ur": "ur-PK",
+}
+
+
+def _mymemory_code(code: str) -> str:
+    return _MYMEMORY_LANG.get(code, code)
+
+
+@app.post("/translate")
+async def translate(body: TranslateRequest):
+    """Translate text using deep-translator (free, no API key).
+    Tries GoogleTranslator first, falls back to MyMemoryTranslator."""
+    text = body.text.strip()
+    if not text:
+        return JSONResponse({"success": False, "error": "empty text"}, status_code=400)
+
+    # Chunk long text — MyMemory has a 500-char limit per request
+    def chunk_text(t: str, max_len: int = 450) -> list[str]:
+        if len(t) <= max_len:
+            return [t]
+        chunks = []
+        while t:
+            if len(t) <= max_len:
+                chunks.append(t)
+                break
+            idx = t.rfind('. ', 0, max_len)
+            if idx == -1:
+                idx = t.rfind(' ', 0, max_len)
+            if idx == -1:
+                idx = max_len
+            else:
+                idx += 1
+            chunks.append(t[:idx].strip())
+            t = t[idx:].strip()
+        return [c for c in chunks if c]
+
+    errors = []
+
+    # Try GoogleTranslator first (uses short codes: en, hi, etc.)
+    try:
+        from deep_translator import GoogleTranslator
+        translated = GoogleTranslator(source=body.source, target=body.target).translate(text)
+        if translated:
+            return {"success": True, "text": translated}
+    except Exception as e:
+        errors.append(f"Google: {e}")
+
+    # Fallback: MyMemoryTranslator (free, needs full locale codes)
+    try:
+        from deep_translator import MyMemoryTranslator
+        src = _mymemory_code(body.source)
+        tgt = _mymemory_code(body.target)
+        chunks = chunk_text(text)
+        parts = []
+        for chunk in chunks:
+            result = MyMemoryTranslator(source=src, target=tgt).translate(chunk)
+            parts.append(result or "")
+        translated = " ".join(parts).strip()
+        if translated:
+            return {"success": True, "text": translated}
+    except Exception as e:
+        errors.append(f"MyMemory: {e}")
+
+    return JSONResponse(
+        {"success": False, "error": f"All translators failed: {'; '.join(errors)}"},
+        status_code=500,
+    )
 
 
 @app.post("/ocr")

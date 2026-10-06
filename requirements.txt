@@ -8,3 +8,4 @@ uvicorn[standard]
 python-multipart
 opencv-python-headless
 numpy
+deep-translator
