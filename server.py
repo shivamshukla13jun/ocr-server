@@ -8,7 +8,7 @@ Endpoints:
   GET  /health        -> { ok, engine }
 """
 
-import io
+import os
 import numpy as np
 import cv2
 from fastapi import FastAPI, UploadFile, File
@@ -18,25 +18,48 @@ from pydantic import BaseModel
 app = FastAPI()
 _engine = None
 
+# PADDLE_OCR_MODEL=server (default, accurate) | mobile (fast, low RAM)
+_MODEL_TIER = os.environ.get("PADDLE_OCR_MODEL", "server").strip().lower()
+# Minimum recognition confidence to keep a text line
+_MIN_SCORE = float(os.environ.get("OCR_MIN_SCORE", "0.5"))
+# Strip height for splitting tall webtoon pages
+_STRIP_HEIGHT = int(os.environ.get("OCR_STRIP_HEIGHT", "2200"))
+_STRIP_OVERLAP = int(os.environ.get("OCR_STRIP_OVERLAP", "160"))
+
 
 def get_engine():
-    """Lazy-load PaddleOCR with the lightweight PP-OCR mobile models."""
+    """Lazy-load PaddleOCR. Defaults to the accurate server models;
+    set PADDLE_OCR_MODEL=mobile for the lightweight models on weak CPUs."""
     global _engine
     if _engine is not None:
         return _engine
     from paddleocr import PaddleOCR
 
+    tier = _MODEL_TIER
     try:
-        # PaddleOCR 3.x — mobile (lightweight) detection + recognition models
-        _engine = PaddleOCR(
-            lang="en",
-            text_detection_model_name="PP-OCRv5_mobile_det",
-            text_recognition_model_name="PP-OCRv5_mobile_rec",
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            device="cpu",
-        )
+        det = "PP-OCRv5_server_det" if tier == "server" else "PP-OCRv5_mobile_det"
+        rec = "PP-OCRv5_server_rec" if tier == "server" else "PP-OCRv5_mobile_rec"
+        try:
+            _engine = PaddleOCR(
+                lang="en",
+                text_detection_model_name=det,
+                text_recognition_model_name=rec,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                device="cpu",
+            )
+        except Exception:
+            # Server models unavailable → fall back to mobile
+            _engine = PaddleOCR(
+                lang="en",
+                text_detection_model_name="PP-OCRv5_mobile_det",
+                text_recognition_model_name="PP-OCRv5_mobile_rec",
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                device="cpu",
+            )
     except TypeError:
         # PaddleOCR 2.x fallback signature
         _engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
@@ -191,6 +214,17 @@ def _sharpen_text(img: np.ndarray) -> np.ndarray:
     return cv2.addWeighted(img, 1.3, blurred, -0.3, 0)
 
 
+def _ocr_prep(img: np.ndarray) -> np.ndarray:
+    """Lightweight preparation applied inside /ocr before detection:
+    border cleanup + adaptive contrast + text sharpening. (The heavier
+    denoise/watermark-inpaint pipeline stays in /preprocess for pages the
+    user explicitly wants cleaned and saved.)"""
+    img = _clean_borders(img)
+    img = _auto_level(img)
+    img = _sharpen_text(img)
+    return img
+
+
 def preprocess_image(img: np.ndarray) -> np.ndarray:
     """Full manga page cleaning pipeline."""
     # 1. Denoise (bilateral preserves edges better than fastNlMeans for manga)
@@ -258,56 +292,68 @@ def _mymemory_code(code: str) -> str:
     return _MYMEMORY_LANG.get(code, code)
 
 
+def _chunk_text(t: str, max_len: int) -> list[str]:
+    """Split at sentence boundaries so translators get coherent chunks.
+    GoogleTranslator degrades on >1200-char blobs; MyMemory caps at ~450."""
+    if len(t) <= max_len:
+        return [t]
+    chunks: list[str] = []
+    while t:
+        if len(t) <= max_len:
+            chunks.append(t)
+            break
+        idx = -1
+        for sep in ('. ', '! ', '? ', '… ', '" ', "' "):
+            idx = max(idx, t.rfind(sep, 0, max_len))
+        if idx <= 0:
+            idx = t.rfind(' ', 0, max_len)
+        if idx <= 0:
+            idx = max_len
+        else:
+            idx += 1
+        chunks.append(t[:idx].strip())
+        t = t[idx:].strip()
+    return [c for c in chunks if c]
+
+
 @app.post("/translate")
 async def translate(body: TranslateRequest):
     """Translate text using deep-translator (free, no API key).
-    Tries GoogleTranslator first, falls back to MyMemoryTranslator."""
+    GoogleTranslator first (sentence-chunked), then MyMemoryTranslator."""
+    import time
+
     text = body.text.strip()
     if not text:
         return JSONResponse({"success": False, "error": "empty text"}, status_code=400)
 
-    # Chunk long text — MyMemory has a 500-char limit per request
-    def chunk_text(t: str, max_len: int = 450) -> list[str]:
-        if len(t) <= max_len:
-            return [t]
-        chunks = []
-        while t:
-            if len(t) <= max_len:
-                chunks.append(t)
-                break
-            idx = t.rfind('. ', 0, max_len)
-            if idx == -1:
-                idx = t.rfind(' ', 0, max_len)
-            if idx == -1:
-                idx = max_len
-            else:
-                idx += 1
-            chunks.append(t[:idx].strip())
-            t = t[idx:].strip()
-        return [c for c in chunks if c]
-
     errors = []
 
-    # Try GoogleTranslator first (uses short codes: en, hi, etc.)
+    # Try GoogleTranslator first — better EN->HI quality, chunked per ~1200 chars
     try:
         from deep_translator import GoogleTranslator
-        translated = GoogleTranslator(source=body.source, target=body.target).translate(text)
+        tr = GoogleTranslator(source=body.source, target=body.target)
+        parts: list[str] = []
+        for chunk in _chunk_text(text, 1200):
+            part = tr.translate(chunk)
+            parts.append(part or "")
+            time.sleep(0.25)  # gentle pacing to avoid rate limits
+        translated = " ".join(p for p in parts if p).strip()
         if translated:
             return {"success": True, "text": translated}
     except Exception as e:
         errors.append(f"Google: {e}")
 
-    # Fallback: MyMemoryTranslator (free, needs full locale codes)
+    # Fallback: MyMemoryTranslator (free, needs full locale codes, 500-char limit)
     try:
         from deep_translator import MyMemoryTranslator
         src = _mymemory_code(body.source)
         tgt = _mymemory_code(body.target)
-        chunks = chunk_text(text)
+        tr = MyMemoryTranslator(source=src, target=tgt)
         parts = []
-        for chunk in chunks:
-            result = MyMemoryTranslator(source=src, target=tgt).translate(chunk)
-            parts.append(result or "")
-        translated = " ".join(parts).strip()
+        for chunk in _chunk_text(text, 450):
+            parts.append(tr.translate(chunk) or "")
+            time.sleep(0.3)
+        translated = " ".join(p for p in parts if p).strip()
         if translated:
             return {"success": True, "text": translated}
     except Exception as e:
@@ -317,6 +363,53 @@ async def translate(body: TranslateRequest):
         {"success": False, "error": f"All translators failed: {'; '.join(errors)}"},
         status_code=500,
     )
+
+
+def _run_ocr(engine, img: np.ndarray) -> list[dict]:
+    result = engine.predict(img) if hasattr(engine, "predict") else engine.ocr(img)
+    return _items_from_result(result)
+
+
+def _ocr_strips(engine, img: np.ndarray) -> list[dict]:
+    """Run OCR on the image, splitting very tall webtoon pages into
+    overlapping horizontal strips — PaddleOCR's detector loses accuracy on
+    extremely tall inputs, and overlapping strips avoid cutting bubbles."""
+    h, _w = img.shape[:2]
+    if h <= _STRIP_HEIGHT:
+        return _run_ocr(engine, img)
+    items: list[dict] = []
+    y = 0
+    while y < h:
+        y2 = min(y + _STRIP_HEIGHT, h)
+        for it in _run_ocr(engine, img[y:y2]):
+            it["y0"] += y
+            it["y1"] += y
+            items.append(it)
+        if y2 >= h:
+            break
+        y = y2 - _STRIP_OVERLAP
+    return items
+
+
+def _dedupe_items(items: list[dict]) -> list[dict]:
+    """Remove duplicate detections produced by strip overlap or the
+    inverted second pass. Same/nested text whose box centres are close
+    is considered a duplicate — keep the higher-confidence one."""
+    out: list[dict] = []
+    for it in sorted(items, key=lambda i: -i["score"]):
+        t = " ".join(str(it["text"]).lower().split())
+        dup = False
+        for kept in out:
+            kt = " ".join(str(kept["text"]).lower().split())
+            if not t or (t != kt and t not in kt and kt not in t):
+                continue
+            if abs((it["y0"] + it["y1"]) / 2 - (kept["y0"] + kept["y1"]) / 2) < 30 and \
+               abs((it["x0"] + it["x1"]) / 2 - (kept["x0"] + kept["x1"]) / 2) < 60:
+                dup = True
+                break
+        if not dup:
+            out.append(it)
+    return out
 
 
 @app.post("/ocr")
@@ -330,11 +423,24 @@ async def ocr(file: UploadFile = File(...)):
         return JSONResponse({"success": False, "error": "could not decode image"}, status_code=400)
 
     try:
+        # Upscale narrow pages — recognition accuracy collapses below ~900px wide
+        h, w = img.shape[:2]
+        if w < 900:
+            scale = 900.0 / w
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        prepared = _ocr_prep(img)
         engine = get_engine()
-        result = engine.predict(img) if hasattr(engine, "predict") else engine.ocr(img)
-        items = _items_from_result(result)
-        # Drop low-confidence fragments — mostly art/speed lines misread as text
-        items = [i for i in items if i["score"] >= 0.45]
+        items = _ocr_strips(engine, prepared)
+
+        # Dark pages (night scenes, black speech bubbles with white text) —
+        # run a second pass on the inverted image to catch them
+        gray = cv2.cvtColor(prepared, cv2.COLOR_BGR2GRAY)
+        if float(np.mean(gray)) < 110:
+            items += _ocr_strips(engine, cv2.bitwise_not(prepared))
+
+        items = _dedupe_items(items)
+        items = [i for i in items if i["score"] >= _MIN_SCORE]
         lines = group_bubbles(items)
         return {"success": True, "lines": lines, "raw": "\n".join(lines)}
     except Exception as e:  # noqa: BLE001
