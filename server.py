@@ -9,14 +9,18 @@ Endpoints:
 """
 
 import os
+import threading
+import time
+import traceback
 import numpy as np
 import cv2
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI()
 _engine = None
+_engine_lock = threading.Lock()
 
 # PADDLE_OCR_MODEL=server (default, accurate) | mobile (fast, low RAM)
 _MODEL_TIER = os.environ.get("PADDLE_OCR_MODEL", "server").strip().lower()
@@ -33,37 +37,72 @@ def get_engine():
     global _engine
     if _engine is not None:
         return _engine
-    from paddleocr import PaddleOCR
+    with _engine_lock:
+        if _engine is not None:
+            return _engine
+        from paddleocr import PaddleOCR
 
-    tier = _MODEL_TIER
-    try:
-        det = "PP-OCRv5_server_det" if tier == "server" else "PP-OCRv5_mobile_det"
-        rec = "PP-OCRv5_server_rec" if tier == "server" else "PP-OCRv5_mobile_rec"
+        tier = _MODEL_TIER
         try:
-            _engine = PaddleOCR(
-                lang="en",
-                text_detection_model_name=det,
-                text_recognition_model_name=rec,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                device="cpu",
-            )
+            det = "PP-OCRv5_server_det" if tier == "server" else "PP-OCRv5_mobile_det"
+            rec = "PP-OCRv5_server_rec" if tier == "server" else "PP-OCRv5_mobile_rec"
+            try:
+                _engine = PaddleOCR(
+                    lang="en",
+                    text_detection_model_name=det,
+                    text_recognition_model_name=rec,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    device="cpu",
+                )
+            except Exception as e:
+                # Server models unavailable → fall back to mobile
+                print(f"[ocr] {det}/{rec} init failed, trying mobile models: {e}", flush=True)
+                _engine = PaddleOCR(
+                    lang="en",
+                    text_detection_model_name="PP-OCRv5_mobile_det",
+                    text_recognition_model_name="PP-OCRv5_mobile_rec",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    device="cpu",
+                )
+        except TypeError:
+            # PaddleOCR 2.x fallback signature
+            _engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
         except Exception:
-            # Server models unavailable → fall back to mobile
-            _engine = PaddleOCR(
-                lang="en",
-                text_detection_model_name="PP-OCRv5_mobile_det",
-                text_recognition_model_name="PP-OCRv5_mobile_rec",
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                device="cpu",
-            )
-    except TypeError:
-        # PaddleOCR 2.x fallback signature
-        _engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+            print("[ocr] PaddleOCR engine init failed:", flush=True)
+            traceback.print_exc()
+            raise
+        print(f"[ocr] PaddleOCR engine ready (tier={tier})", flush=True)
     return _engine
+
+
+def _warmup_engine():
+    """Load PaddleOCR at startup — downloads the models on first run.
+    Retries so a transient download failure doesn't leave every request 500ing."""
+    for attempt in range(1, 4):
+        try:
+            get_engine()
+            return
+        except Exception:
+            print(f"[ocr] engine warmup attempt {attempt}/3 failed:", flush=True)
+            traceback.print_exc()
+            if attempt < 3:
+                time.sleep(10)
+    print("[ocr] engine warmup gave up — /ocr will retry init on demand", flush=True)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Warm up PaddleOCR in a background thread so model downloads and init
+    # errors surface at startup instead of on the first real request.
+    threading.Thread(target=_warmup_engine, daemon=True).start()
+    yield
+
+
+app = FastAPI(lifespan=_lifespan)
 
 
 def _items_from_result(result) -> list[dict]:
@@ -83,6 +122,8 @@ def _items_from_result(result) -> list[dict]:
             texts = res["rec_texts"]
             scores = res.get("rec_scores", [1.0] * len(texts))
             polys = res.get("rec_polys", res.get("dt_polys", res.get("rec_boxes")))
+            if polys is None:
+                continue
             for poly, text, score in zip(polys, texts, scores):
                 pts = np.asarray(poly, dtype=float).reshape(-1, 2)
                 items.append({
@@ -265,6 +306,7 @@ async def preprocess(file: UploadFile = File(...)):
         _, buf = cv2.imencode(".png", result)
         return Response(content=buf.tobytes(), media_type="image/png")
     except Exception as e:
+        traceback.print_exc()
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
 
@@ -381,7 +423,7 @@ def _ocr_strips(engine, img: np.ndarray) -> list[dict]:
     y = 0
     while y < h:
         y2 = min(y + _STRIP_HEIGHT, h)
-        for it in _run_ocr(engine, img[y:y2]):
+        for it in _run_ocr(engine, np.ascontiguousarray(img[y:y2])):
             it["y0"] += y
             it["y1"] += y
             items.append(it)
@@ -444,4 +486,5 @@ async def ocr(file: UploadFile = File(...)):
         lines = group_bubbles(items)
         return {"success": True, "lines": lines, "raw": "\n".join(lines)}
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
