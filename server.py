@@ -86,6 +86,12 @@ def _warmup_engine():
         try:
             get_engine()
             return
+        except ImportError:
+            # A failed import leaves paddlex half-initialized — retrying in the
+            # same process only hits "PDX has already been initialized". Bail.
+            print("[ocr] engine warmup failed (import error — fix the env, no retry):", flush=True)
+            traceback.print_exc()
+            break
         except Exception:
             print(f"[ocr] engine warmup attempt {attempt}/3 failed:", flush=True)
             traceback.print_exc()

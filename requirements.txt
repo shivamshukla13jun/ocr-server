@@ -8,4 +8,8 @@ uvicorn[standard]
 python-multipart
 opencv-python-headless
 numpy
+# pandas 3.x binaries are unsigned and get blocked by Windows Smart App
+# Control ("Application Control policy has blocked this file") — 2.3.x has
+# established reputation and passes.
+pandas<3
 deep-translator
